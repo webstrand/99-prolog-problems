@@ -1,0 +1,98 @@
+#!/usr/bin/env perl
+use utf8;
+use warnings;
+use v5.30;
+use experimental qw(signatures);
+use FindBin;
+use Linux::Inotify2;
+use POSIX qw(:sys_wait_h);
+use Time::HiRes qw(ualarm);
+
+unless(@ARGV) {
+	say STDERR <<EOF;
+usage: $0 swipl -qs 01-list-last.pro
+
+Runs the requested command interactively, SIGKILL-ing and restarting it
+whenever a file in this script's directory is changed. The command may exit
+at any time and will not be restarted until a file change is detected.
+
+Ctrl-C (SIGINT) is intentionally ignored, use Ctrl-\ (SIGQUIT) to kill any
+running command and exit.
+EOF
+	exit(1);
+}
+
+$SIG{INT} = 'IGNORE';
+$SIG{QUIT} = sub { exit };
+
+my $inotify = Linux::Inotify2->new();
+$inotify->watch($FindBin::Bin, IN_CLOSE_WRITE);
+
+my $child = ChldProc->new;
+$SIG{CHLD} = sub {
+	# Handle SIGCHLD in case the ChldProc exits before it is forcibly killed,
+	# otherwise we might end up killing some strange process
+	while((my $pid = waitpid(-1, WNOHANG)) > 0) {
+		$child->detach if $child->pid == $pid;
+	}
+};
+
+for(;;) {
+	print "\n";
+	unless($child->replace(@ARGV)) {
+		say STDERR "$ARGV[0]: $!";
+		exit 1;
+	}
+
+	wait_for_changes();
+
+	# Wait for the changes to settle, before continuing.
+	wait_for_no_changes(200);
+}
+
+sub wait_for_changes() {
+	{ redo unless $inotify->read() }
+}
+
+sub wait_for_no_changes($ms) {
+	local $SIG{ALRM} = sub {};
+	{ ualarm($ms * 1000); redo if $inotify->read() }
+}
+
+package ChldProc {
+	use warnings;
+	use v5.30;
+	use experimental qw(signatures);
+	use POSIX qw(_exit);
+
+	sub new($class) { bless do { \my $pid }, $class }
+	sub pid($pid) { $$pid }
+	sub detach($pid) { $$pid = undef }
+
+	sub replace($pid, @exec) {
+		$pid->kill;
+
+		local $^F = 2;
+		pipe my $out, my $in;
+
+		unless($$pid = fork) {
+			no warnings qw(exec);
+			exec @exec;
+			print $in 0+$!;
+			$in->flush;
+			_exit 1;
+		}
+
+		close $in;
+		not $! = <$out>;
+	}
+
+	sub kill($pid) {
+		kill 'KILL', $$pid if defined $$pid;
+		$$pid = undef;
+	}
+
+	sub DESTROY($pid) {
+		$pid->kill;
+	}
+}
