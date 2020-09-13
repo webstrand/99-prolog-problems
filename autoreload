@@ -5,14 +5,13 @@ use v5.30;
 use experimental qw(signatures);
 use FindBin;
 use Linux::Inotify2;
-use POSIX qw(:sys_wait_h);
 use Time::HiRes qw(ualarm);
 
 unless(@ARGV) {
 	say STDERR <<EOF;
 usage: $0 swipl -qs 01-list-last.pro
 
-Runs the requested command interactively, SIGKILL-ing and restarting it
+Runs the requested command interactively, interrupting and restarting it
 whenever a file in this script's directory is changed. The command may exit
 at any time and will not be restarted until a file change is detected.
 
@@ -22,24 +21,18 @@ EOF
 	exit(1);
 }
 
-$SIG{INT} = 'IGNORE';
+# ======================================================================
+
+$SIG{INT} = "IGNORE";
 $SIG{QUIT} = sub { exit };
 
 my $inotify = Linux::Inotify2->new();
 $inotify->watch($FindBin::Bin, IN_CLOSE_WRITE);
 
-my $child = ChldProc->new;
-$SIG{CHLD} = sub {
-	# Handle SIGCHLD in case the ChldProc exits before it is forcibly killed,
-	# otherwise we might end up killing some strange process
-	while((my $pid = waitpid(-1, WNOHANG)) > 0) {
-		$child->detach if $child->pid == $pid;
-	}
-};
-
+my $child = InteractiveChildProc->new;
 for(;;) {
-	print "\n";
-	unless($child->replace(@ARGV)) {
+	print "\n===============================\n";
+	unless($child->respawn(@ARGV)) {
 		say STDERR "$ARGV[0]: $!";
 		exit 1;
 	}
@@ -50,6 +43,8 @@ for(;;) {
 	wait_for_no_changes(200);
 }
 
+# ======================================================================
+
 sub wait_for_changes() {
 	{ redo unless $inotify->read() }
 }
@@ -59,40 +54,170 @@ sub wait_for_no_changes($ms) {
 	{ ualarm($ms * 1000); redo if $inotify->read() }
 }
 
-package ChldProc {
+package InteractiveChildProc {
 	use warnings;
 	use v5.30;
 	use experimental qw(signatures);
-	use POSIX qw(_exit);
+	use POSIX qw(:sys_wait_h _exit);
+	use IO::Pty;
+	use IO::Tty::Constant qw(TIOCGWINSZ TIOCSWINSZ);
+	use Syntax::Keyword::Try;
+
+	# private subs
+	sub close_all_fds;
+	sub watcher_proc;
+	use namespace::clean;
 
 	sub new($class) { bless do { \my $pid }, $class }
-	sub pid($pid) { $$pid }
-	sub detach($pid) { $$pid = undef }
 
-	sub replace($pid, @exec) {
-		$pid->kill;
+	sub respawn($pid, $command, @args) {
+		$pid->abort;
+		$pid->spawn($command, @args);
+	}
 
+	sub spawn($pid, $command, @args) {
+		die "process $$pid already running" if defined $$pid;
+
+		# We need to catch and handle errors from exec in the child process. So
+		# we open a pipe and pass the writer end to the child process. If exec
+		# succeeds, the child will close the other end of the pipe. If it fails,
+		# the child will write the error into the pipe.
 		local $^F = 2;
-		pipe my $out, my $in;
+		pipe my $child_error, my $error or die "Unable to pipe: $!";
 
-		unless($$pid = fork) {
+		# The child_proc cleans up any unnecessary file descriptors and writes
+		# any exec errors to the $error pipe.
+		my sub child_proc() {
+			close_all_fds(\*STDIN, \*STDOUT, \*STDERR, $error);
 			no warnings qw(exec);
-			exec @exec;
-			print $in 0+$!;
-			$in->flush;
+			exec $command, @args;
+			print $error 0+$!;
+			$error->flush;
 			_exit 1;
 		}
 
-		close $in;
-		not $! = <$out>;
+		# We spawn the watcher_proc, which will spawn the child process, to
+		# copy STDIN into the child and reap the child when it exits. The
+		# watcher_proc will not exit
+		unless($$pid = fork) {
+			try {
+				watcher_proc(\&child_proc);
+			}
+			catch {
+				warn $@;
+			}
+			finally {
+				warn "control-flow escaped watcher_proc in watcher process";
+				_exit 127;
+			}
+		}
+		else {
+			close $error;
+			$! = <$child_error>;
+			return not $!;
+		}
 	}
 
-	sub kill($pid) {
-		kill 'KILL', $$pid if defined $$pid;
-		$$pid = undef;
+	sub abort($pid) {
+		if(defined $$pid) {
+			# The watcher process only responds to
+			kill ABRT => $$pid;
+			scalar waitpid($$pid, 0);
+			$$pid = undef;
+		}
 	}
 
 	sub DESTROY($pid) {
-		$pid->kill;
+		$pid->abort;
+	}
+
+	sub watcher_proc($child_proc) {
+		# We need to be able to close the writer end of the child_proc's STDIN,
+		# to interrupt any blocking read and signal termination. So we create a
+		# new PTY to attach to the child.
+		local $^F = 2;
+		my $pty = IO::Pty->new;
+		my $slave = $pty->slave;
+
+		# We fork, replace the real STDIN with our fake one, and then spawn the
+		# requested child_proc.
+		my $child_pid;
+		unless($child_pid = fork) {
+			try {
+				close STDIN;
+				open STDIN, "<&", $slave or die "Can't dup slave pty: $!";
+				$pty->close;
+				$child_proc->();
+			}
+			catch {
+				warn $@;
+			}
+			finally {
+				warn "control-flow escaped child_proc in child process";
+				_exit 127;
+			}
+		}
+
+		# Can't close $slave, IO::Pty doesn't like that and throws an error
+		# when we later try to $pty->close().
+		close_all_fds(\*STDIN,\*STDOUT,\*STDERR,$pty,$slave);
+		$slave->close;
+
+		# TTYs generate a whole host of different signals. We only want the
+		# watcher_proc to exit when the main process signals it to exit.
+		$SIG{$_} = "IGNORE" foreach(keys %SIG);
+
+		$SIG{ABRT} = sub {
+			# If the child_proc has already exited, we can exit immediately.
+			_exit 0 unless(defined $child_pid);
+
+			# Processes stuck on blocking reads of STDIN may ignore signals
+			# until STDIN is closed.
+			$pty->close;
+			kill HUP => $child_pid;
+
+			# We allow the process a maximum of two seconds to exit. Sleep will
+			# be interrupted by SIGCHLD if the child_proc responds to the
+			# signal and exits.
+			sleep(2);
+
+			# Our SIGCHLD handler clears the $child_pid when it reaps
+			# the process.
+			if(defined $child_pid) {
+				say STDERR "Child process failed to exit cleanly.";
+				kill KILL => $child_pid;
+			}
+			_exit 0;
+		};
+
+		# We accept SIGCHLD to both interrupt the sleep() called by our SIGABRT
+		# handler, and to undef $child_pid when it exits.
+		$SIG{CHLD} = sub {
+			while((my $pid = waitpid(-1, WNOHANG)) > 0) {
+				undef $child_pid if $child_pid == $pid;
+			}
+		};
+
+		$SIG{WINCH} = sub {
+			ioctl(STDIN, TIOCGWINSZ, my $winsize);
+			ioctl($pty, TIOCSWINSZ, $winsize);
+		};
+
+		# Copy the STDIN shared with the main process into the child_proc.
+		while(sysread(STDIN, my $str, 256)) {
+			syswrite($pty, $str);
+		}
+		_exit 0;
+	}
+
+	sub close_all_fds (@protected) {
+		opendir(my $dir, "/proc/self/fd");
+		my %protected = map { ref $_ ? fileno($_) : $_ => undef } @protected;
+		$protected{fileno $dir} = undef;
+
+		foreach(grep /\d/, readdir $dir) {
+			next if exists $protected{$_};
+			POSIX::close($_);
+		}
 	}
 }
